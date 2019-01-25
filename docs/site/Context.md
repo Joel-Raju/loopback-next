@@ -229,3 +229,150 @@ class HelloController {
 These "sugar" decorators allow you to quickly build up your application without
 having to code up all the additional logic by simply giving LoopBack hints (in
 the form of metadata) to your intent.
+
+## Context events
+
+The `Context` emits the following events:
+
+- `bind`: Emitted when a new binding is added to the context.
+  - binding: the newly added binding object
+- `unbind`: Emitted when an existing binding is removed from the context
+  - binding: the newly removed binding object
+- `error`: Emitted when an observer throws an error during the notification
+  process
+  - err: the error object thrown
+
+When an existing binding key is replaced with a new one, an `unbind` event is
+emitted for the existing binding followed by a `bind` event for the new binding.
+
+## Context observers
+
+Bindings can be added or removed to a context object. With emitted context
+events, we can add listeners to a context object to be invoked when bindings
+come and go. There are a few caveats associated with that:
+
+1. The binding object might not be fully configured when a `bind` event is
+   emitted.
+
+   For example:
+
+   ```ts
+   const ctx = new Context();
+   ctx
+     .bind('foo')
+     .to('foo-value')
+     .tag('foo-tag');
+   ctx.on('bind', binding => {
+     console.log(binding.tagNames); // returns an empty array `[]`
+   });
+   ```
+
+   The context object emits a `bind` event when `ctx.bind` method is called. It
+   does not control the fluent apis `.to('foo-value').tag('foo-tag')`, which
+   happens on the newly created binding object. As a result, the `bind` event
+   listener receives a binding object which only has the binding key populated.
+
+   A workaround is to create the binding first before add it to a context:
+
+   ```ts
+   const ctx = new Context();
+   const binding = Binding.create('foo')
+     .to('foo-value')
+     .tag('foo-tag');
+   ctx.add(binding);
+   ctx.on('bind', binding => {
+     console.log(binding.tagMap); // returns `['foo-tag']`
+   });
+   ```
+
+2. It's hard for event listeners to perform asynchronous operations.
+
+To make it easy to support asynchronous event processing, we introduce
+`ContextObserver` and corresponding APIs on `Context:
+
+1. ContextObserver interface
+
+```ts
+/**
+ * Observers of context bind/unbind events
+ */
+export interface ContextObserver {
+  /**
+   * An optional filter function to match bindings. If not present, the listener
+   * will be notified of all binding events.
+   */
+  filter?: BindingFilter;
+
+  /**
+   * Listen on `bind`, `unbind`, or other events
+   * @param eventType Context event type
+   * @param binding The binding as event source
+   */
+  observe(
+    eventType: ContextEventType,
+    binding: Readonly<Binding<unknown>>,
+    context: Context,
+  ): ValueOrPromise<void>;
+}
+```
+
+2. Context APIs
+
+- `subscribe(observer: ContextObserver)`
+
+  Add a context event observer to the context chain, including its ancestors
+
+- `unsubscribe(observer: ContextObserver)`
+
+  Remove the context event observer from the context chain
+
+- `close()`
+
+  Close the context and release references to other objects in the context
+  chain. Please note observers of a child context are also registered with its
+  parent context. As a result, the `close` method must be called to avoid memory
+  leak if the child context is to be recycled.
+
+To react on context events asynchronously, we need to implement the
+`ContextObserver` interface and register it with the context.
+
+For example:
+
+```ts
+const app = new Context('app');
+server = new Context(app, 'server');
+
+const observer: ContextObserver = {
+  // Only interested in bindings tagged with `foo`
+  filter: binding => binding.tagMap.foo != null,
+
+  observe(event: ContextEventType, binding: Readonly<Binding<unknown>>) {
+    if (event === 'bind') {
+      console.log('bind: %s', binding.key);
+      // ... perform async operation
+    } else if (event === 'unbind') {
+      console.log('unbind: %s', binding.key);
+      // ... perform async operation
+    }
+  },
+};
+
+server.subscribe(observer);
+server
+  .bind('foo-server')
+  .to('foo-value')
+  .tag('foo');
+app
+  .bind('foo-app')
+  .to('foo-value')
+  .tag('foo');
+
+// The following messages will be printed:
+// bind: foo-server
+// bind: foo-app
+```
+
+It's recommended that `ContextObserver` implementations should not throw errors
+in `observe` method. Uncaught errors will be reported as `error` events of the
+context object. If there is no error listener registered, the node process will
+crash.

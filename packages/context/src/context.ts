@@ -4,20 +4,38 @@
 // License text available at https://opensource.org/licenses/MIT
 
 import * as debugModule from 'debug';
+import {EventEmitter} from 'events';
 import {v1 as uuidv1} from 'uuid';
 import {ValueOrPromise} from '.';
 import {Binding, BindingTag} from './binding';
+import {BindingFilter, filterByKey, filterByTag} from './binding-filter';
 import {BindingAddress, BindingKey} from './binding-key';
+import {
+  ContextEventType,
+  ContextObserver,
+  Subscription,
+} from './context-observer';
 import {ResolutionOptions, ResolutionSession} from './resolution-session';
 import {BoundValue, getDeepProperty, isPromiseLike} from './value-promise';
-import {BindingFilter, filterByKey, filterByTag} from './binding-filter';
+
+/**
+ * Polyfill Symbol.asyncIterator as required by TypeScript for Node 8.x.
+ * See https://www.typescriptlang.org/docs/handbook/release-notes/typescript-2-3.html
+ */
+if (!Symbol.asyncIterator) {
+  // tslint:disable-next-line:no-any
+  (Symbol as any).asyncIterator = Symbol.for('Symbol.asyncIterator');
+}
+
+// FIXME: `@types/p-event` is out of date against `p-event@2.2.0`
+const pEvent = require('p-event');
 
 const debug = debugModule('loopback:context');
 
 /**
  * Context provides an implementation of Inversion of Control (IoC) container
  */
-export class Context {
+export class Context extends EventEmitter {
   /**
    * Name of the context
    */
@@ -34,16 +52,142 @@ export class Context {
   protected _parent?: Context;
 
   /**
-   * Create a new context
+   * A list of registered context observers
+   */
+  protected readonly observers: Set<ContextObserver> = new Set();
+
+  /**
+   * Internal counter for pending events which observers have not processed yet
+   */
+  private pendingEvents = 0;
+
+  /**
+   * Create a new context. For example,
+   * ```ts
+   * // Create a new root context, let the framework to create a unique name
+   * const rootCtx = new Context();
+   *
+   * // Create a new child context inheriting bindings from `rootCtx`
+   * const childCtx = new Context(rootCtx);
+   *
+   * // Create another root context called "application"
+   * const appCtx = new Context('application');
+   *
+   * // Create a new child context called "request" and inheriting bindings
+   * // from `appCtx`
+   * const reqCtx = new Context(appCtx, 'request');
+   * ```
    * @param _parent The optional parent context
+   * @param name Name of the context, if not provided, a `uuid` will be
+   * generated as the name
    */
   constructor(_parent?: Context | string, name?: string) {
+    super();
     if (typeof _parent === 'string') {
       name = _parent;
       _parent = undefined;
     }
     this._parent = _parent;
     this.name = name || uuidv1();
+
+    this.setupEventHandlers();
+  }
+
+  /**
+   * Wrap the debug statement so that it always print out the context name
+   * as the prefix
+   * @param formatter
+   * @param args
+   */
+  // tslint:disable-next-line:no-any
+  private _debug(formatter: any, ...args: any[]) {
+    /* istanbul ignore if */
+    if (debug.enabled) {
+      if (typeof formatter === 'string') {
+        debug(`[%s] ${formatter}`, this.name, ...args);
+      } else {
+        debug('[%s] ', this.name, formatter, ...args);
+      }
+    }
+  }
+
+  /**
+   * Set up an internal listener to notify registered observers asynchronously
+   * upon `bind` and `unbind` events
+   */
+  private setupEventHandlers() {
+    // The following are two async functions. Returned promises are ignored as
+    // they are long-running background tasks.
+    this.startNotificationTask('bind').catch(err => {
+      // Catch error to avoid lint violations
+      debug(err);
+      this.emit('error', err);
+    });
+    this.startNotificationTask('unbind').catch(err => {
+      // Catch error to avoid lint violations
+      debug(err);
+      this.emit('error', err);
+    });
+  }
+
+  /**
+   * Start a background task to listen on context events and notify observers
+   * @param eventType Context event type
+   */
+  private async startNotificationTask(eventType: ContextEventType) {
+    const notificationEvent = `${eventType}-notification`;
+    this.on(eventType, binding => {
+      // No need to schedule notifications if no observers are present
+      if (this.observers.size === 0) return;
+      // Track pending events
+      this.pendingEvents++;
+      // Take a snapshot of current observers to ensure notifications of this
+      // event will only be sent to current ones. Emit a new event to notify
+      // current context observers.
+      this.emit(notificationEvent, {
+        binding,
+        observers: new Set(this.observers),
+      });
+    });
+    // FIXME(rfeng): p-event should allow multiple event types in an iterator.
+    // Create an async iterator from the given event type
+    const events: AsyncIterable<{
+      binding: Readonly<Binding<unknown>>;
+      observers: Set<ContextObserver>;
+    }> = pEvent.iterator(this, notificationEvent);
+    for await (const event of events) {
+      // The loop will happen asynchronously upon events
+      try {
+        // The execution of observers happen in the Promise micro-task queue
+        const binding = event.binding;
+        await this.notifyObservers(eventType, binding, event.observers);
+        this.pendingEvents--;
+        this._debug(
+          'Observers notified for %s of binding %s',
+          eventType,
+          binding.key,
+        );
+        this.emit('observersNotified', {eventType, binding});
+      } catch (err) {
+        this.pendingEvents--;
+        this._debug('Error caught from observers', err);
+        // Errors caught from observers. Emit it to the current context.
+        // If no error listeners are registered, crash the process.
+        this.emit('error', err);
+      }
+    }
+  }
+
+  /**
+   * Wait until observers are notified for all of currently pending events.
+   *
+   * This method is for test only to perform assertions after observers are
+   * notified for relevant events.
+   */
+  protected async waitForObserversNotifiedForPendingEvents(timeout?: number) {
+    const count = this.pendingEvents;
+    if (count === 0) return;
+    await pEvent.multiple(this, 'observersNotified', {count, timeout});
   }
 
   /**
@@ -67,19 +211,22 @@ export class Context {
    */
   add(binding: Binding<unknown>): this {
     const key = binding.key;
-    /* istanbul ignore if */
-    if (debug.enabled) {
-      debug('Adding binding: %s', key);
-    }
-
+    this._debug('[%s] Adding binding: %s', key);
+    let existingBinding: Binding | undefined;
     const keyExists = this.registry.has(key);
     if (keyExists) {
-      const existingBinding = this.registry.get(key);
+      existingBinding = this.registry.get(key);
       const bindingIsLocked = existingBinding && existingBinding.isLocked;
       if (bindingIsLocked)
         throw new Error(`Cannot rebind key "${key}" to a locked binding`);
     }
     this.registry.set(key, binding);
+    if (existingBinding !== binding) {
+      if (existingBinding != null) {
+        this.emit('unbind', existingBinding);
+      }
+      this.emit('bind', binding);
+    }
     return this;
   }
 
@@ -94,12 +241,90 @@ export class Context {
    * @returns true if the binding key is found and removed from this context
    */
   unbind(key: BindingAddress): boolean {
+    this._debug('Unbind %s', key);
     key = BindingKey.validate(key);
     const binding = this.registry.get(key);
+    // If not found, return `false`
     if (binding == null) return false;
     if (binding && binding.isLocked)
       throw new Error(`Cannot unbind key "${key}" of a locked binding`);
-    return this.registry.delete(key);
+    this.registry.delete(key);
+    this.emit('unbind', binding);
+    return true;
+  }
+
+  /**
+   * Add a context event observer to the context chain, including its ancestors
+   * @param observer Context event observer
+   */
+  subscribe(observer: ContextObserver): Subscription {
+    let ctx: Context | undefined = this;
+    while (ctx != null) {
+      ctx.observers.add(observer);
+      ctx = ctx._parent;
+    }
+    return new ContextSubscription(this, observer);
+  }
+
+  /**
+   * Remove the context event observer from the context chain
+   * @param observer Context event observer
+   */
+  unsubscribe(observer: ContextObserver) {
+    let ctx: Context | undefined = this;
+    while (ctx != null) {
+      ctx.observers.delete(observer);
+      ctx = ctx._parent;
+    }
+  }
+
+  /**
+   * Close the context and release references to other objects in the context
+   * chain.
+   *
+   * This method MUST be called to avoid memory leaks once a context object is
+   * no longer needed and should be GCed. An example is the `RequestContext`,
+   * which is created per request.
+   */
+  close() {
+    this._debug('Closing context...');
+    for (const observer of this.observers) {
+      this.unsubscribe(observer);
+    }
+    this.registry.clear();
+    this._parent = undefined;
+  }
+
+  /**
+   * Check if an observer is subscribed to this context
+   * @param observer Context observer
+   */
+  isSubscribed(observer: ContextObserver) {
+    return this.observers.has(observer);
+  }
+
+  /**
+   * Publish an event to the registered observers. Please note the
+   * notification is queued and performed asynchronously so that we allow fluent
+   * APIs such as `ctx.bind('key').to(...).tag(...);` and give observers the
+   * fully populated binding.
+   *
+   * @param eventType Event names: `bind` or `unbind`
+   * @param binding Binding bound or unbound
+   * @param observers Current set of context observers
+   */
+  protected async notifyObservers(
+    eventType: ContextEventType,
+    binding: Readonly<Binding<unknown>>,
+    observers = this.observers,
+  ) {
+    if (observers.size === 0) return;
+
+    for (const observer of observers) {
+      if (!observer.filter || observer.filter(binding)) {
+        await observer.observe(eventType, binding, this);
+      }
+    }
   }
 
   /**
@@ -137,7 +362,7 @@ export class Context {
   }
 
   /**
-   * Find bindings using the key pattern
+   * Find bindings using a key pattern or filter function
    * @param pattern A filter function, a regexp or a wildcard pattern with
    * optional `*` and `?`. Find returns such bindings where the key matches
    * the provided pattern.
@@ -253,10 +478,7 @@ export class Context {
     keyWithPath: BindingAddress<ValueType>,
     optionsOrSession?: ResolutionOptions | ResolutionSession,
   ): Promise<ValueType | undefined> {
-    /* istanbul ignore if */
-    if (debug.enabled) {
-      debug('Resolving binding: %s', keyWithPath);
-    }
+    this._debug('Resolving binding: %s', keyWithPath);
     return await this.getValueOrPromise<ValueType | undefined>(
       keyWithPath,
       optionsOrSession,
@@ -323,10 +545,8 @@ export class Context {
     keyWithPath: BindingAddress<ValueType>,
     optionsOrSession?: ResolutionOptions | ResolutionSession,
   ): ValueType | undefined {
-    /* istanbul ignore if */
-    if (debug.enabled) {
-      debug('Resolving binding synchronously: %s', keyWithPath);
-    }
+    this._debug('Resolving binding synchronously: %s', keyWithPath);
+
     const valueOrPromise = this.getValueOrPromise<ValueType>(
       keyWithPath,
       optionsOrSession,
@@ -449,5 +669,26 @@ export class Context {
       json[k] = v.toJSON();
     }
     return json;
+  }
+}
+
+/**
+ * An implementation of `Subscription` interface for context events
+ */
+class ContextSubscription implements Subscription {
+  constructor(
+    protected context: Context,
+    protected observer: ContextObserver,
+  ) {}
+
+  private _closed = false;
+
+  unsubscribe() {
+    this.context.unsubscribe(this.observer);
+    this._closed = true;
+  }
+
+  get closed() {
+    return this._closed;
   }
 }
