@@ -11,6 +11,7 @@ import {Binding, BindingTag} from './binding';
 import {BindingFilter, filterByKey, filterByTag} from './binding-filter';
 import {BindingAddress, BindingKey} from './binding-key';
 import {
+  ContextEventObserver,
   ContextEventType,
   ContextObserver,
   Subscription,
@@ -54,7 +55,7 @@ export class Context extends EventEmitter {
   /**
    * A list of registered context observers
    */
-  protected readonly observers: Set<ContextObserver> = new Set();
+  protected readonly observers: Set<ContextEventObserver> = new Set();
 
   /**
    * Internal counter for pending events which observers have not processed yet
@@ -100,14 +101,14 @@ export class Context extends EventEmitter {
    * @param args
    */
   // tslint:disable-next-line:no-any
-  private _debug(formatter: any, ...args: any[]) {
+  private _debug(...args: any[]) {
     /* istanbul ignore if */
-    if (debug.enabled) {
-      if (typeof formatter === 'string') {
-        debug(`[%s] ${formatter}`, this.name, ...args);
-      } else {
-        debug('[%s] ', this.name, formatter, ...args);
-      }
+    if (!debug.enabled) return;
+    const formatter = args.shift();
+    if (typeof formatter === 'string') {
+      debug(`[%s] ${formatter}`, this.name, ...args);
+    } else {
+      debug('[%s] ', this.name, formatter, ...args);
     }
   }
 
@@ -116,18 +117,32 @@ export class Context extends EventEmitter {
    * upon `bind` and `unbind` events
    */
   private setupEventHandlers() {
+    // tslint:disable-next-line:no-any
+    const notificationErrorHandler = (...args: any[]) => {
+      this._debug(...args);
+      // Bubbling up the error event over the context chain
+      // until we find an error listener
+      let ctx: Context | undefined = this;
+      while (ctx) {
+        if (ctx.listenerCount('error') === 0) {
+          // No error listener found, try its parent
+          ctx = ctx._parent;
+          continue;
+        }
+        this._debug('Emitting error to context %s', ctx.name);
+        ctx.emit('error', ...args);
+        return;
+      }
+      // No context with error listeners found
+      this._debug('No error handler is configured for the context chain');
+      // Let it crash now by emitting an error event
+      this.emit('error', ...args);
+    };
+
     // The following are two async functions. Returned promises are ignored as
     // they are long-running background tasks.
-    this.startNotificationTask('bind').catch(err => {
-      // Catch error to avoid lint violations
-      debug(err);
-      this.emit('error', err);
-    });
-    this.startNotificationTask('unbind').catch(err => {
-      // Catch error to avoid lint violations
-      debug(err);
-      this.emit('error', err);
-    });
+    this.startNotificationTask('bind').catch(notificationErrorHandler);
+    this.startNotificationTask('unbind').catch(notificationErrorHandler);
   }
 
   /**
@@ -153,14 +168,13 @@ export class Context extends EventEmitter {
     // Create an async iterator from the given event type
     const events: AsyncIterable<{
       binding: Readonly<Binding<unknown>>;
-      observers: Set<ContextObserver>;
+      observers: Set<ContextEventObserver>;
     }> = pEvent.iterator(this, notificationEvent);
-    for await (const event of events) {
+    for await (const {binding, observers} of events) {
       // The loop will happen asynchronously upon events
       try {
         // The execution of observers happen in the Promise micro-task queue
-        const binding = event.binding;
-        await this.notifyObservers(eventType, binding, event.observers);
+        await this.notifyObservers(eventType, binding, observers);
         this.pendingEvents--;
         this._debug(
           'Observers notified for %s of binding %s',
@@ -255,9 +269,9 @@ export class Context extends EventEmitter {
 
   /**
    * Add a context event observer to the context chain, including its ancestors
-   * @param observer Context event observer
+   * @param observer Context observer instance or function
    */
-  subscribe(observer: ContextObserver): Subscription {
+  subscribe(observer: ContextEventObserver): Subscription {
     let ctx: Context | undefined = this;
     while (ctx != null) {
       ctx.observers.add(observer);
@@ -270,7 +284,7 @@ export class Context extends EventEmitter {
    * Remove the context event observer from the context chain
    * @param observer Context event observer
    */
-  unsubscribe(observer: ContextObserver) {
+  unsubscribe(observer: ContextEventObserver) {
     let ctx: Context | undefined = this;
     while (ctx != null) {
       ctx.observers.delete(observer);
@@ -321,7 +335,9 @@ export class Context extends EventEmitter {
     if (observers.size === 0) return;
 
     for (const observer of observers) {
-      if (!observer.filter || observer.filter(binding)) {
+      if (typeof observer === 'function') {
+        await observer(eventType, binding, this);
+      } else if (!observer.filter || observer.filter(binding)) {
         await observer.observe(eventType, binding, this);
       }
     }
@@ -678,7 +694,7 @@ export class Context extends EventEmitter {
 class ContextSubscription implements Subscription {
   constructor(
     protected context: Context,
-    protected observer: ContextObserver,
+    protected observer: ContextEventObserver,
   ) {}
 
   private _closed = false;

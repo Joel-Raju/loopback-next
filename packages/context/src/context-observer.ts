@@ -15,6 +15,18 @@ import {Context} from './context';
 export type ContextEventType = 'bind' | 'unbind' | string;
 
 /**
+ * Listen on `bind`, `unbind`, or other events
+ * @param eventType Context event type
+ * @param binding The binding as event source
+ * @param context Context object for the binding event
+ */
+export type ContextObserverFn = (
+  eventType: ContextEventType,
+  binding: Readonly<Binding<unknown>>,
+  context: Context,
+) => ValueOrPromise<void>;
+
+/**
  * Observers of context bind/unbind events
  */
 export interface ContextObserver {
@@ -29,12 +41,13 @@ export interface ContextObserver {
    * @param eventType Context event type
    * @param binding The binding as event source
    */
-  observe(
-    eventType: ContextEventType,
-    binding: Readonly<Binding<unknown>>,
-    context: Context,
-  ): ValueOrPromise<void>;
+  observe: ContextObserverFn;
 }
+
+/**
+ * Context event observer type - An instance of `ContextObserver` or a function
+ */
+export type ContextEventObserver = ContextObserver | ContextObserverFn;
 
 /**
  * Subscription of context events. It's modeled after

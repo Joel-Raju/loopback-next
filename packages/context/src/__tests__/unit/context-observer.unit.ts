@@ -13,6 +13,7 @@ import {
   filterByTag,
 } from '../..';
 
+const pEvent = require('p-event');
 const setImmediateAsync = promisify(setImmediate);
 
 /**
@@ -85,7 +86,7 @@ describe('Context', () => {
     function givenNonMatchingObserver() {
       nonMatchingObserver = {
         filter: binding => false,
-        observe: (event, binding) => {},
+        observe: () => {},
       };
     }
   });
@@ -174,13 +175,10 @@ describe('Context', () => {
       ctx.bind('foo').to('foo-value');
       process.nextTick(() => {
         // Register a new observer after 1st event
-        const anotherObserver: ContextObserver = {
-          observe: (event, binding, context) => {
-            const val = binding.getValue(context);
-            events.push(`LATE:${binding.key}:${val}:${event}`);
-          },
-        };
-        ctx.subscribe(anotherObserver);
+        ctx.subscribe((event, binding, context) => {
+          const val = binding.getValue(context);
+          events.push(`LATE:${binding.key}:${val}:${event}`);
+        });
       });
 
       await ctx.waitUntilObserversNotified();
@@ -208,7 +206,7 @@ describe('Context', () => {
       // An observer does not match the criteria
       const nonMatchingObserver: ContextObserver = {
         filter: binding => false,
-        observe: (event, binding) => {
+        observe: () => {
           nonMatchingObserverCalled = true;
         },
       };
@@ -268,6 +266,32 @@ describe('Context', () => {
       // Add a new controller - server: 3
       givenController(server, '3');
       expect(await getControllers()).to.eql(['3']);
+    });
+
+    it('reports error on current context if an observer fails', async () => {
+      const err = new Error('something wrong');
+      server.subscribe((event, binding) => {
+        if (binding.key === 'bar') {
+          return Promise.reject(err);
+        }
+      });
+      server.bind('bar').to('bar-value');
+      // Please note the following code registers an `error` listener on `server`
+      const obj = await pEvent(server, 'error');
+      expect(obj).to.equal(err);
+    });
+
+    it('reports error on the first context with error listeners on the chain', async () => {
+      const err = new Error('something wrong');
+      server.subscribe((event, binding) => {
+        if (binding.key === 'bar') {
+          return Promise.reject(err);
+        }
+      });
+      server.bind('bar').to('bar-value');
+      // No error listener is registered on `server`
+      const obj = await pEvent(app, 'error');
+      expect(obj).to.equal(err);
     });
 
     class MyObserverForControllers implements ContextObserver {

@@ -288,11 +288,23 @@ come and go. There are a few caveats associated with that:
 2. It's hard for event listeners to perform asynchronous operations.
 
 To make it easy to support asynchronous event processing, we introduce
-`ContextObserver` and corresponding APIs on `Context:
+`ContextObserver` and corresponding APIs on `Context`:
 
-1. ContextObserver interface
+1. `ContextObserverFn` type and `ContextObserver` interface
 
 ```ts
+/**
+ * Listen on `bind`, `unbind`, or other events
+ * @param eventType Context event type
+ * @param binding The binding as event source
+ * @param context Context object for the binding event
+ */
+export type ContextObserverFn = (
+  eventType: ContextEventType,
+  binding: Readonly<Binding<unknown>>,
+  context: Context,
+) => ValueOrPromise<void>;
+
 /**
  * Observers of context bind/unbind events
  */
@@ -308,21 +320,24 @@ export interface ContextObserver {
    * @param eventType Context event type
    * @param binding The binding as event source
    */
-  observe(
-    eventType: ContextEventType,
-    binding: Readonly<Binding<unknown>>,
-    context: Context,
-  ): ValueOrPromise<void>;
+  observe: ContextObserverFn;
 }
+
+/**
+ * Context event observer type - An instance of `ContextObserver` or a function
+ */
+export type ContextEventObserver = ContextObserver | ContextObserverFn;
 ```
+
+If `filter` is not required, we can simply use `ContextObserverFn`.
 
 2. Context APIs
 
-- `subscribe(observer: ContextObserver)`
+- `subscribe(observer: ContextEventObserver)`
 
   Add a context event observer to the context chain, including its ancestors
 
-- `unsubscribe(observer: ContextObserver)`
+- `unsubscribe(observer: ContextEventObserver)`
 
   Remove the context event observer from the context chain
 
@@ -334,7 +349,8 @@ export interface ContextObserver {
   leak if the child context is to be recycled.
 
 To react on context events asynchronously, we need to implement the
-`ContextObserver` interface and register it with the context.
+`ContextObserver` interface or provide a `ContextObserverFn` and register it
+with the context.
 
 For example:
 
@@ -372,7 +388,31 @@ app
 // bind: foo-app
 ```
 
-It's recommended that `ContextObserver` implementations should not throw errors
-in `observe` method. Uncaught errors will be reported as `error` events of the
-context object. If there is no error listener registered, the node process will
-crash.
+Please note when an observer subscribes to a context, it will be registered with
+all contexts on the chain. In the example above, the observer is added to both
+`server` and `app` contexts so that it can be notified when bindings are added
+or removed from any of the context on the chain.
+
+- Observers are called in the next turn of
+  [Promise micro-task queue](https://jsblog.insiderattack.net/promises-next-ticks-and-immediates-nodejs-event-loop-part-3-9226cbe7a6aa)
+
+- When there are multiple async observers registered, they are notified in
+  series for an event.
+
+- When multiple binding events are emitted in the same event loop tick and there
+  are async observers registered, such events are queued and observers are
+  notified by the order of events.
+
+### Observer error handling
+
+It's recommended that `ContextEventObserver` implementations should not throw
+errors in their code. Errors thrown by context event observers are reported as
+follows over the context chain.
+
+1. Check if the current context object has `error` listeners, if yes, emit an
+   `error` event on the context and we're done. if not, try its parent context
+   by repeating step 1.
+
+2. If no context object of the chain has `error` listeners, emit an `error`
+   event on the current context. As a result, the process exits abnormally. See
+   https://nodejs.org/api/events.html#events_error_events for more details.
