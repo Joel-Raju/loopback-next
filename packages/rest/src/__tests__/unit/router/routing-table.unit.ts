@@ -6,19 +6,19 @@
 import {anOpenApiSpec} from '@loopback/openapi-spec-builder';
 import {get, getControllerSpec, param} from '@loopback/openapi-v3';
 import {
-  ShotRequestOptions,
   expect,
+  ShotRequestOptions,
   stubExpressContext,
 } from '@loopback/testlab';
+import * as HttpErrors from 'http-errors';
 import {
   ControllerRoute,
-  Request,
-  RoutingTable,
-  RestRouter,
   RegExpRouter,
+  Request,
+  RestRouter,
+  RoutingTable,
   TrieRouter,
 } from '../../..';
-import * as HttpErrors from 'http-errors';
 
 describe('RoutingTable', () => {
   it('joins basePath and path', () => {
@@ -212,6 +212,44 @@ function runTestsWithRouter(router: RestRouter) {
     let route = table.find(request);
     expect(route.path).to.eql('/my/getProfile/{userId}.{format}');
     expect(route.pathParams).to.containEql({userId: '1', format: 'json'});
+  });
+
+  it('finds "GET /orders/ and GET /orders/{id}" endpoints', () => {
+    class TestController {
+      @get('/orders/{id}')
+      async getOrderById(@param.path.number('id') id: number): Promise<object> {
+        return {id};
+      }
+      // With trailing `/`
+      @get('/orders/')
+      async findOrders(): Promise<object[]> {
+        return [];
+      }
+      // Without trailing `/`
+      @get('/pendingOrders')
+      async findPendingOrders(): Promise<object[]> {
+        return [];
+      }
+    }
+
+    const table = givenRoutingTable();
+    const spec = getControllerSpec(TestController);
+    table.registerController(spec, TestController);
+
+    const findAndCheckRoute = (url: string, expectedPath: string) => {
+      let request = givenRequest({
+        method: 'get',
+        url,
+      });
+      const route = table.find(request);
+      expect(route.path).to.eql(expectedPath);
+    };
+
+    findAndCheckRoute('/orders/1', '/orders/{id}');
+    findAndCheckRoute('/orders', '/orders');
+    findAndCheckRoute('/orders/', '/orders');
+    findAndCheckRoute('/pendingOrders', '/pendingOrders');
+    findAndCheckRoute('/pendingOrders/', '/pendingOrders');
   });
 
   it('throws if router is not found', () => {

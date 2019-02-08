@@ -19,9 +19,7 @@ export abstract class BaseRouter implements RestRouter {
   protected routesWithoutPathVars: {[path: string]: RouteEntry} = {};
 
   protected getKeyForRoute(route: RouteEntry) {
-    const path = route.path.startsWith('/') ? route.path : `/${route.path}`;
-    const verb = route.verb.toLowerCase() || 'get';
-    return `/${verb}${path}`;
+    return getKey(route.verb, route.path);
   }
 
   add(route: RouteEntry) {
@@ -34,8 +32,7 @@ export abstract class BaseRouter implements RestRouter {
   }
 
   protected getKeyForRequest(request: Request) {
-    const method = request.method.toLowerCase();
-    return `/${method}${request.path}`;
+    return getKey(request.method, request.path);
   }
 
   find(request: Request) {
@@ -71,4 +68,23 @@ export abstract class BaseRouter implements RestRouter {
    * List routes with path variables
    */
   protected abstract listRoutesWithPathVars(): RouteEntry[];
+}
+
+/**
+ * Build a key for verb+path
+ * @param verb HTTP verb/method
+ * @param path URL path
+ */
+function getKey(verb: string, path: string) {
+  // Use lower case
+  verb = (verb && verb.toLowerCase()) || 'get';
+  // Prepend `/` if needed
+  path = path || '/';
+  path = path.startsWith('/') ? path : `/${path}`;
+  if (path !== '/' && path.endsWith('/')) {
+    // Remove trailing `/`
+    // See https://github.com/strongloop/loopback-next/issues/2188
+    path = path.substring(0, path.length - 1);
+  }
+  return `/${verb}${path}`;
 }
