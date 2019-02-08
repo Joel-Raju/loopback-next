@@ -5,15 +5,17 @@
 
 import {inject} from '@loopback/context';
 import {
-  RestBindings,
-  RestServerConfig,
   OpenApiSpecForm,
   Request,
   Response,
+  RestBindings,
+  RestServerConfig,
 } from '@loopback/rest';
 import * as ejs from 'ejs';
 import * as fs from 'fs';
 import * as path from 'path';
+import {RestExplorerBindings} from './rest-explorer.keys';
+import {RestExplorerConfig} from './rest-explorer.types';
 
 // TODO(bajtos) Allow users to customize the template
 const indexHtml = path.resolve(__dirname, '../templates/index.html.ejs');
@@ -21,24 +23,25 @@ const template = fs.readFileSync(indexHtml, 'utf-8');
 const templateFn = ejs.compile(template);
 
 export class ExplorerController {
+  private explorerPath: string;
   private openApiSpecUrl: string;
 
   constructor(
     @inject(RestBindings.CONFIG, {optional: true})
     restConfig: RestServerConfig = {},
+    @inject(RestExplorerBindings.CONFIG, {optional: true})
+    config: RestExplorerConfig = {},
     @inject(RestBindings.Http.REQUEST) private request: Request,
     @inject(RestBindings.Http.RESPONSE) private response: Response,
   ) {
     this.openApiSpecUrl = this.getOpenApiSpecUrl(restConfig);
-  }
-
-  indexRedirect() {
-    this.response.redirect(301, this.request.url + '/');
+    this.explorerPath = config.path || '/explorer';
   }
 
   index() {
     const data = {
       openApiSpecUrl: this.openApiSpecUrl,
+      explorerPath: this.explorerPath,
     };
 
     const homePage = templateFn(data);

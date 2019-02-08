@@ -24,8 +24,7 @@ export class RestExplorerComponent implements Component {
   ) {
     const explorerPath = config.path || '/explorer';
 
-    this.registerControllerRoute('get', explorerPath, 'indexRedirect');
-    this.registerControllerRoute('get', explorerPath + '/', 'index');
+    this.registerControllerRoute('get', explorerPath, 'index');
 
     application.static(explorerPath, swaggerUI.getAbsoluteFSPath());
 

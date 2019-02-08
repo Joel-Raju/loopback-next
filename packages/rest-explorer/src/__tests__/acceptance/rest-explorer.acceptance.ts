@@ -36,11 +36,12 @@ describe('API Explorer (acceptance)', () => {
         .expect(/<title>LoopBack API Explorer/);
     });
 
-    it('redirects from "/explorer" to "/explorer/"', async () => {
+    it('exposes API Explorer at "/explorer"', async () => {
       await request
         .get('/explorer')
-        .expect(301)
-        .expect('location', '/explorer/');
+        .expect(200)
+        .expect('content-type', /html/)
+        .expect(/<title>LoopBack API Explorer/);
     });
 
     it('configures swagger-ui with OpenAPI spec url "/openapi.json', async () => {
@@ -92,8 +93,7 @@ describe('API Explorer (acceptance)', () => {
 
       await request
         .get('/openapi/ui')
-        .expect(301)
-        .expect('Location', '/openapi/ui/');
+        .expect(200, /<title>LoopBack API Explorer/);
 
       await request.get('/explorer').expect(404);
     });
