@@ -15,6 +15,6 @@ packages/cli/generators/datasource/connectors.json
 docs/site/readmes
 
 # Exclude all files under sandbox except README.md and example
-/sandbox/*
+!/sandbox/test-app
 !/sandbox/README.md
 !/sandbox/example/
